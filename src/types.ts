@@ -1,22 +1,14 @@
 export interface Employee {
   id: string;
-  name: string;
-  department: string;
-  contractDate: string;
-  totalQuota: number;
-  usedQuota: number;
+  nama: string;
+  departemen: string;
+  tglKontrak: string;
+  jatahAwal: number;
+  terpakai: number;
 }
 
-export interface LeaveRequest {
+export interface ActivityLog {
   id: string;
-  employeeId: string;
-  employeeName: string;
-  department: string;
-  startDate: string;
-  endDate: string;
-  daysCount: number;
-  description: string;
   timestamp: string;
+  pesan: string;
 }
-
-export type ViewState = 'dashboard' | 'history';

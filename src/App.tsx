@@ -1,5 +1,5 @@
 /**
- * PT Feen Marine — HR Management System v7.0
+ * PT Feen Marine — HR Management System v8.0
  * Firebase Realtime Database + Full Auth + Overseas Monitor + Auto Leave Accrual
  *
  * Features:
@@ -8,14 +8,17 @@
  * - Leave quota auto-increment monthly based on contract date
  * - Overseas monitoring (Commissioning / Service)
  * - Configuration page
+ * - [NEW] Kalender Cuti & Overseas terintegrasi
+ * - [NEW] Dashboard Analytics (bar chart per departemen)
+ * - [NEW] Pencarian Global (karyawan + log + overseas)
  * - Professional UI/UX
  *
  * Install: npm install firebase
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { initializeApp, getApps } from 'firebase/app';
-import { getDatabase, ref, onValue, set, remove, off, DataSnapshot, push } from 'firebase/database';
+import { getDatabase, ref, onValue, set, remove, off, DataSnapshot  } from 'firebase/database';
 
 // ─── FIREBASE CONFIG ──────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -32,7 +35,8 @@ const db = getDatabase(firebaseApp);
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const DEPARTMENTS = ["Electrical & Automation", "Engineering", "Operations", "Finance & Admin", "Procurement"];
-const OVERSEAS_TYPES = ["Commissioning", "Service"] as const;
+const OVERSEAS_TYPES = ["Commissioning", "Service", "Mengurus Visa", "Other"] as const;
+const FAT_CLASSES = ["ClassNK", "DNV", "LR", "BV", "ABS", "RINA"] as const;
 const AUTO_LOGOUT_MINUTES = 30;
 
 // ─── TYPES ────────────────────────────────────────────────────────────────────
@@ -45,6 +49,7 @@ interface AppUser {
   role: UserRole;
   displayName: string;
   createdAt: string;
+  linkedEmployeeName?: string; // nama karyawan yang terhubung ke user ini
 }
 
 interface Employee {
@@ -94,7 +99,18 @@ type ToastKind = 'success' | 'error' | 'warning' | 'info';
 interface ToastItem { id: string; msg: string; kind: ToastKind; }
 type SortCol = 'nama' | 'departemen' | 'tglKontrak' | 'jatahAwal' | 'terpakai' | 'sisa';
 type HistSortCol = 'timestamp' | 'nama' | 'departemen' | 'tglCuti' | 'keterangan' | '';
-type ActivePage = 'dashboard' | 'history' | 'overseas' | 'config' | 'users';
+type ActivePage = 'dashboard' | 'history' | 'overseas' | 'fat' | 'calendar' | 'analytics' | 'config' | 'users';
+
+interface FATEntry {
+  id: string;
+  projectNo: string;
+  fatClass: typeof FAT_CLASSES[number];
+  fatDateTime: string; // ISO datetime string
+  assignedTo: string;  // employee name
+  keterangan?: string;
+  createdAt: string;
+  createdBy: string;
+}
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const fmtDate = (d: string) => {
@@ -147,6 +163,14 @@ const can = (role: UserRole | null, action: 'write' | 'delete' | 'config' | 'man
   return false; // viewer: read only
 };
 
+// Cek apakah user boleh edit karyawan tertentu (karyawan bisa edit data dirinya sendiri di dashboard cuti)
+const canEditOwnLeave = (currentUser: AppUser | null, empNama: string): boolean => {
+  if (!currentUser) return false;
+  if (currentUser.role === 'superadmin' || currentUser.role === 'admin') return true;
+  // Viewer: hanya bisa log cuti milik sendiri jika linkedEmployeeName cocok
+  return !!(currentUser.linkedEmployeeName && currentUser.linkedEmployeeName === empNama);
+};
+
 // ─── CLOCK ────────────────────────────────────────────────────────────────────
 function useClock() {
   const [time, setTime] = useState(''); const [date, setDate] = useState('');
@@ -169,6 +193,7 @@ function useFirebase() {
   const [logs,      setLogs]      = useState<LogEntry[]>([]);
   const [overseas,  setOverseas]  = useState<OverseasEntry[]>([]);
   const [appUsers,  setAppUsers]  = useState<AppUser[]>([]);
+  const [fatEntries, setFatEntries] = useState<FATEntry[]>([]);
   const [config,    setConfig]    = useState<AppConfig>({
     companyName: 'PT Feen Marine',
     monthlyAccrualDays: 1,
@@ -186,6 +211,7 @@ function useFirebase() {
     const ovsRef   = ref(db, 'overseas');
     const usrRef   = ref(db, 'appUsers');
     const cfgRef   = ref(db, 'config');
+    const fatRef   = ref(db, 'fatEntries');
 
     onValue(empRef, (snap: DataSnapshot) => {
       const data = snap.val() as Record<string,Employee>|null;
@@ -213,9 +239,14 @@ function useFirebase() {
       if (data) setConfig(data);
     });
 
+    onValue(fatRef, (snap: DataSnapshot) => {
+      const data = snap.val() as Record<string,FATEntry>|null;
+      setFatEntries(data ? Object.values(data).sort((a,b)=>a.fatDateTime.localeCompare(b.fatDateTime)) : []);
+    });
+
     onValue(connRef, (snap: DataSnapshot) => setOnline(!!snap.val()));
 
-    return () => { off(empRef); off(logRef); off(connRef); off(ovsRef); off(usrRef); off(cfgRef); };
+    return () => { off(empRef); off(logRef); off(connRef); off(ovsRef); off(usrRef); off(cfgRef); off(fatRef); };
   }, []);
 
   const fbSaveEmployee   = useCallback(async (e: Employee)       => set(ref(db,`employees/${e.id}`), e), []);
@@ -227,11 +258,14 @@ function useFirebase() {
   const fbSaveUser       = useCallback(async (u: AppUser)        => set(ref(db,`appUsers/${u.id}`), u), []);
   const fbDeleteUser     = useCallback(async (id: string)        => remove(ref(db,`appUsers/${id}`)), []);
   const fbSaveConfig     = useCallback(async (c: AppConfig)      => set(ref(db,'config'), c), []);
+  const fbSaveFAT        = useCallback(async (f: FATEntry)       => set(ref(db,`fatEntries/${f.id}`), f), []);
+  const fbDeleteFAT      = useCallback(async (id: string)        => remove(ref(db,`fatEntries/${id}`)), []);
 
   return {
-    employees, logs, overseas, appUsers, config, syncing, online,
+    employees, logs, overseas, appUsers, config, fatEntries, syncing, online,
     fbSaveEmployee, fbDeleteEmployee, fbAddLog, fbClearLogs,
-    fbSaveOverseas, fbDeleteOverseas, fbSaveUser, fbDeleteUser, fbSaveConfig
+    fbSaveOverseas, fbDeleteOverseas, fbSaveUser, fbDeleteUser, fbSaveConfig,
+    fbSaveFAT, fbDeleteFAT
   };
 }
 
@@ -447,7 +481,7 @@ function LoginPage({ appUsers, onLogin, companyName }: {
           </div>
         )}
         <p className="text-center text-blue-200/60 text-[11px] mt-6">
-          {companyName} · HRMS v7.0 · Batam
+          {companyName} · HRMS v8.0 · Batam
         </p>
       </div>
 
@@ -461,7 +495,7 @@ function LoginPage({ appUsers, onLogin, companyName }: {
 }
 
 // ─── OVERSEAS FORM DIALOG ─────────────────────────────────────────────────────
-function OverseasDialog({ open, entry, employees, currentUser, onSave, onClose }: {
+function OverseasDialog({ open, entry, employees, onSave, onClose }: {
   open: boolean;
   entry: OverseasEntry | null;
   employees: Employee[];
@@ -576,18 +610,741 @@ function OverseasDialog({ open, entry, employees, currentUser, onSave, onClose }
   );
 }
 
+
+// ─── FAT DIALOG ───────────────────────────────────────────────────────────────
+function FATDialog({ open, entry, automationEngineers, fatEntries, onSave, onClose }: {
+  open: boolean;
+  entry: FATEntry | null;
+  automationEngineers: Employee[];
+  fatEntries: FATEntry[];
+  onSave: (data: Omit<FATEntry,'id'|'createdAt'|'createdBy'>) => void;
+  onClose: () => void;
+}) {
+  const [projectNo,   setProjectNo]   = useState('');
+  const [fatClass,    setFatClass]    = useState<typeof FAT_CLASSES[number]>('ClassNK');
+  const [fatDateTime, setFatDateTime] = useState('');
+  const [assignedTo,  setAssignedTo]  = useState('');
+  const [ket,         setKet]         = useState('');
+
+  // Hitung jumlah FAT per orang (urutan adil)
+  const fatCountMap = useMemo(() => {
+    const map: Record<string,number> = {};
+    automationEngineers.forEach(e => { map[e.nama] = 0; });
+    fatEntries.forEach(f => { if (map[f.assignedTo] !== undefined) map[f.assignedTo]++; });
+    return map;
+  }, [fatEntries, automationEngineers]);
+
+  // Rekomendasi: yang paling sedikit FAT
+  const recommendation = useMemo(() => {
+    if (automationEngineers.length === 0) return null;
+    return Object.entries(fatCountMap).sort((a,b) => a[1]-b[1])[0]?.[0] || null;
+  }, [fatCountMap]);
+
+  useEffect(() => {
+    if (entry) {
+      setProjectNo(entry.projectNo);
+      setFatClass(entry.fatClass);
+      setFatDateTime(entry.fatDateTime);
+      setAssignedTo(entry.assignedTo);
+      setKet(entry.keterangan || '');
+    } else {
+      setProjectNo(''); setFatClass('ClassNK'); setFatDateTime('');
+      setAssignedTo(recommendation || ''); setKet('');
+    }
+  }, [entry, open, recommendation]);
+
+  if (!open) return null;
+  const inp = "w-full h-11 px-3 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:border-[#005A9E] focus:ring-2 focus:ring-[#005A9E]/10 transition";
+
+  const handleSave = () => {
+    if (!projectNo || !fatDateTime || !assignedTo) return;
+    onSave({ projectNo, fatClass, fatDateTime, assignedTo, keterangan: ket });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[10000] p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden" style={{animation:'scaleIn .18s ease-out'}}>
+        <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 bg-cyan-100 rounded-xl flex items-center justify-center">🔬</div>
+            <h3 className="font-bold text-base text-slate-800">{entry ? 'Edit Jadwal FAT' : 'Tambah Jadwal FAT'}</h3>
+          </div>
+          <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition">✕</button>
+        </div>
+        <div className="px-5 py-4 space-y-3.5 max-h-[75vh] overflow-y-auto">
+          {/* Rekomendasi */}
+          {!entry && recommendation && (
+            <div className="px-3 py-2.5 bg-cyan-50 border border-cyan-200 rounded-xl text-sm">
+              <div className="flex items-center gap-2">
+                <span className="text-cyan-600 font-bold text-base">💡</span>
+                <div>
+                  <span className="font-semibold text-cyan-700">Rekomendasi: </span>
+                  <span className="text-cyan-800 font-bold">{recommendation}</span>
+                  <span className="text-cyan-600 text-xs ml-1">({fatCountMap[recommendation] || 0}x FAT sebelumnya)</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 mb-1.5">No. Project *</label>
+              <input className={inp} placeholder="FMI-XXX atau FM-XX" value={projectNo} onChange={e=>setProjectNo(e.target.value)} />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 mb-1.5">Class *</label>
+              <select className={inp} value={fatClass} onChange={e=>setFatClass(e.target.value as any)}>
+                {FAT_CLASSES.map(c=><option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 mb-1.5">Tanggal & Waktu FAT *</label>
+            <input type="datetime-local" className={inp} value={fatDateTime} onChange={e=>setFatDateTime(e.target.value)} />
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 mb-1.5">Assigned To (Automation Engineer) *</label>
+            <select className={inp} value={assignedTo} onChange={e=>setAssignedTo(e.target.value)}>
+              <option value="">-- Pilih Engineer --</option>
+              {automationEngineers
+                .sort((a,b) => (fatCountMap[a.nama]||0) - (fatCountMap[b.nama]||0))
+                .map(e => (
+                  <option key={e.id} value={e.nama}>
+                    {e.nama} — {fatCountMap[e.nama] || 0}x FAT
+                    {e.nama === recommendation ? ' ⭐ Rekomendasi' : ''}
+                  </option>
+                ))}
+            </select>
+          </div>
+
+          {/* FAT count summary */}
+          {automationEngineers.length > 0 && (
+            <div className="bg-slate-50 rounded-xl p-3">
+              <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Distribusi FAT saat ini</div>
+              <div className="space-y-1.5">
+                {automationEngineers
+                  .sort((a,b) => (fatCountMap[a.nama]||0) - (fatCountMap[b.nama]||0))
+                  .map(e => {
+                    const cnt = fatCountMap[e.nama] || 0;
+                    const isRec = e.nama === recommendation;
+                    return (
+                      <div key={e.id} className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          {isRec && <span className="text-amber-500 text-xs">⭐</span>}
+                          <span className={`text-sm ${isRec ? 'font-bold text-cyan-700' : 'text-slate-600'}`}>{e.nama}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="flex gap-0.5">
+                            {Array.from({length: Math.min(cnt, 10)}).map((_,i) => (
+                              <div key={i} className="w-2 h-2 bg-cyan-400 rounded-sm" />
+                            ))}
+                            {cnt > 10 && <span className="text-[10px] text-slate-400">+{cnt-10}</span>}
+                          </div>
+                          <span className="text-xs font-bold text-slate-500 w-8 text-right">{cnt}x</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-500 mb-1.5">Keterangan (opsional)</label>
+            <textarea className={inp + ' h-16 resize-none pt-2.5'} placeholder="Catatan tambahan..." value={ket} onChange={e=>setKet(e.target.value)} />
+          </div>
+        </div>
+        <div className="px-5 pb-5 flex gap-3 border-t border-slate-100 pt-4">
+          <button onClick={onClose} className="flex-1 h-11 rounded-xl border border-slate-200 bg-slate-50 text-sm font-semibold hover:bg-slate-100 active:scale-95 transition text-slate-700">Batal</button>
+          <button onClick={handleSave} className="flex-1 h-11 rounded-xl bg-cyan-600 text-white text-sm font-bold hover:bg-cyan-700 active:scale-95 transition">
+            💾 Simpan
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── FAT PAGE ─────────────────────────────────────────────────────────────────
+function FATPage({ fatEntries, employees, currentUser, onAdd, onEdit, onDelete }: {
+  fatEntries: FATEntry[];
+  employees: Employee[];
+  currentUser: AppUser;
+  onAdd: () => void;
+  onEdit: (entry: FATEntry) => void;
+  onDelete: (id: string) => void;
+}) {
+  const automationEngineers = employees.filter(e =>
+    e.departemen === 'Electrical & Automation' &&
+    (e.posisi||'').toLowerCase().includes('automation')
+  );
+
+  // FAT count per person
+  const fatCountMap = useMemo(() => {
+    const map: Record<string,number> = {};
+    automationEngineers.forEach(e => { map[e.nama] = 0; });
+    fatEntries.forEach(f => { if (map[f.assignedTo] !== undefined) map[f.assignedTo]++; });
+    // Also count people assigned but not in filtered list
+    fatEntries.forEach(f => { if (map[f.assignedTo] === undefined) map[f.assignedTo] = (map[f.assignedTo]||0)+1; });
+    return map;
+  }, [fatEntries, automationEngineers]);
+
+  const recommendation = Object.entries(fatCountMap)
+    .filter(([name]) => automationEngineers.some(e=>e.nama===name))
+    .sort((a,b)=>a[1]-b[1])[0]?.[0] || null;
+
+  const now = new Date();
+  const upcoming = fatEntries.filter(f => new Date(f.fatDateTime) > now);
+  const past = fatEntries.filter(f => new Date(f.fatDateTime) <= now);
+
+  const fmtDateTime = (dt: string) => {
+    if (!dt) return '-';
+    const d = new Date(dt);
+    const M = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des'];
+    const days = ['Min','Sen','Sel','Rab','Kam','Jum','Sab'];
+    return `${days[d.getDay()]}, ${String(d.getDate()).padStart(2,'0')} ${M[d.getMonth()]} ${d.getFullYear()} · ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  };
+
+  const classBadge: Record<string,string> = {
+    ClassNK: 'bg-blue-100 text-blue-700 border-blue-200',
+    DNV: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+    LR: 'bg-red-100 text-red-700 border-red-200',
+    BV: 'bg-purple-100 text-purple-700 border-purple-200',
+    ABS: 'bg-amber-100 text-amber-700 border-amber-200',
+    RINA: 'bg-cyan-100 text-cyan-700 border-cyan-200',
+  };
+
+  return (
+    <div className="h-full overflow-y-auto p-2 sm:p-4 space-y-4">
+      {/* Stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        {[
+          {v: fatEntries.length, l:'Total FAT', c:'text-cyan-700', bg:'bg-cyan-50 border-cyan-200'},
+          {v: upcoming.length,   l:'Upcoming', c:'text-blue-700', bg:'bg-blue-50 border-blue-200'},
+          {v: past.length,       l:'Selesai', c:'text-slate-600', bg:'bg-slate-50 border-slate-200'},
+          {v: automationEngineers.length, l:'Automation Eng.', c:'text-purple-700', bg:'bg-purple-50 border-purple-200'},
+        ].map(({v,l,c,bg})=>(
+          <div key={l} className={`border rounded-2xl p-3 text-center ${bg}`}>
+            <div className={`text-2xl font-extrabold ${c}`}>{v}</div>
+            <div className="text-[10px] text-slate-400 mt-0.5">{l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Recommendation panel */}
+      {recommendation && (
+        <div className="bg-gradient-to-r from-cyan-50 to-blue-50 border border-cyan-200 rounded-2xl p-4">
+          <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">🔄 Giliran FAT Berikutnya</div>
+          <div className="flex flex-wrap gap-3">
+            {automationEngineers
+              .sort((a,b)=>(fatCountMap[a.nama]||0)-(fatCountMap[b.nama]||0))
+              .map((e, rank) => (
+                <div key={e.id} className={`flex items-center gap-2 px-3 py-2 rounded-xl border ${rank===0?'bg-cyan-100 border-cyan-300':'bg-white border-slate-200'}`}>
+                  <span className={`text-lg ${rank===0?'':'opacity-40'}`}>{rank===0?'⭐':rank===1?'🥈':rank===2?'🥉':'👤'}</span>
+                  <div>
+                    <div className={`text-sm font-bold ${rank===0?'text-cyan-700':'text-slate-600'}`}>{e.nama}</div>
+                    <div className="text-[10px] text-slate-400">{fatCountMap[e.nama]||0}x FAT total</div>
+                  </div>
+                </div>
+              ))}
+          </div>
+        </div>
+      )}
+
+      {/* Add button */}
+      {can(currentUser.role, 'write') && (
+        <div className="flex justify-end">
+          <button onClick={onAdd} className="h-9 px-4 bg-cyan-600 hover:bg-cyan-700 text-white rounded-xl text-sm font-bold transition flex items-center gap-2">
+            ➕ Tambah Jadwal FAT
+          </button>
+        </div>
+      )}
+
+      {/* FAT list */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+        {fatEntries.length === 0 ? (
+          <div className="text-center py-16 text-slate-400">
+            <div className="text-5xl mb-3">🔬</div>
+            <p className="text-sm">Belum ada jadwal FAT</p>
+          </div>
+        ) : (
+          <div className="overflow-auto" style={{maxHeight:'calc(100vh - 380px)'}}>
+            <table className="w-full border-collapse text-[13px]">
+              <thead>
+                <tr className="bg-[#EFF1F3]">
+                  {['No. Project','Class','Waktu FAT','Assigned To','Status','Keterangan','Aksi'].map(h=>(
+                    <th key={h} className="sticky top-0 bg-[#EFF1F3] px-3 py-2.5 text-left text-[10px] font-bold text-slate-500 uppercase tracking-wider border-b border-slate-200 whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {fatEntries.map((f,i) => {
+                  const isPast = new Date(f.fatDateTime) <= now;
+                  return (
+                    <tr key={f.id} className={`border-b border-slate-100 group ${i%2===0?'bg-white':'bg-slate-50'}`}>
+                      <td className="px-3 py-2.5 font-mono font-bold text-[#005A9E] text-xs">{f.projectNo}</td>
+                      <td className="px-3 py-2.5">
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-bold border ${classBadge[f.fatClass]||'bg-slate-100 text-slate-600 border-slate-200'}`}>{f.fatClass}</span>
+                      </td>
+                      <td className="px-3 py-2.5 text-xs text-slate-600 whitespace-nowrap">{fmtDateTime(f.fatDateTime)}</td>
+                      <td className="px-3 py-2.5">
+                        <div className="font-semibold text-slate-800">{f.assignedTo}</div>
+                        <div className="text-[10px] text-slate-400">{fatCountMap[f.assignedTo]||0}x total FAT</div>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-bold border ${isPast?'bg-emerald-100 text-emerald-700 border-emerald-200':'bg-blue-100 text-blue-700 border-blue-200'}`}>
+                          {isPast?'✅ Selesai':'🕐 Upcoming'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2.5 text-xs text-slate-400 max-w-[180px] truncate">{f.keterangan||'-'}</td>
+                      <td className="px-3 py-2.5">
+                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition">
+                          {can(currentUser.role,'write') && (
+                            <button onClick={()=>onEdit(f)} className="w-7 h-7 bg-blue-50 text-blue-600 rounded-lg text-xs hover:bg-blue-100">✏️</button>
+                          )}
+                          {can(currentUser.role,'delete') && (
+                            <button onClick={()=>onDelete(f.id)} className="w-7 h-7 bg-red-50 text-red-600 rounded-lg text-xs hover:bg-red-100">🗑️</button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+const MONTH_ID = ['Januari','Februari','Maret','April','Mei','Juni','Juli','Agustus','September','Oktober','November','Desember'];
+const DAY_ID   = ['Min','Sen','Sel','Rab','Kam','Jum','Sab'];
+
+function parseLeaveRange(tglCuti: string): {start:string; end:string} | null {
+  if (!tglCuti) return null;
+  const s = tglCuti.trim();
+  if (s.includes(' s/d ')) {
+    const parts = s.split(' s/d ');
+    const start = parts[0].trim();
+    const end   = parts[1].trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(start) && /^\d{4}-\d{2}-\d{2}$/.test(end)) return {start, end};
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return {start:s, end:s};
+  return null;
+}
+
+function datesBetween(start: string, end: string): string[] {
+  const result: string[] = [];
+  const cur = new Date(start + 'T00:00:00');
+  const last = new Date(end + 'T00:00:00');
+  while (cur <= last) { result.push(cur.toISOString().slice(0,10)); cur.setDate(cur.getDate()+1); }
+  return result;
+}
+
+interface CalEvent { nama:string; dept:string; tipe:'cuti'|'overseas'; info?:string; }
+
+// ─── CALENDAR PAGE ────────────────────────────────────────────────────────────
+function CalendarPage({ logs, overseas }: { logs:LogEntry[]; overseas:OverseasEntry[] }) {
+  const today = new Date();
+  const [year,  setYear]  = useState(today.getFullYear());
+  const [month, setMonth] = useState(today.getMonth());
+  const [selDate, setSelDate] = useState<string|null>(today.toISOString().slice(0,10));
+  const [fDept,  setFDept]  = useState('');
+  const [fTipe,  setFTipe]  = useState<''|'cuti'|'overseas'>('');
+
+  // Build event map: date -> CalEvent[]
+  const eventMap = useMemo<Record<string, CalEvent[]>>(() => {
+    const map: Record<string, CalEvent[]> = {};
+    const add = (date: string, ev: CalEvent) => { if (!map[date]) map[date]=[]; map[date].push(ev); };
+
+    // Cuti from logs (only real leave entries, skip accrual/add/edit/reset logs)
+    logs.forEach(log => {
+      const skip = ['ditambahkan','diperbarui','reset','accrual','auto'].some(k => log.keterangan.toLowerCase().includes(k));
+      if (skip) return;
+      const range = parseLeaveRange(log.tglCuti);
+      if (!range) return;
+      datesBetween(range.start, range.end).forEach(d => add(d, {nama:log.nama, dept:log.departemen, tipe:'cuti'}));
+    });
+
+    // Overseas
+    overseas.forEach(o => {
+      if (!o.tglMulai || !o.tglSelesai) return;
+      datesBetween(o.tglMulai, o.tglSelesai).forEach(d =>
+        add(d, {nama:o.nama, dept:o.departemen, tipe:'overseas', info:`${o.tipe} · ${o.lokasi} · ${o.projectNo}`})
+      );
+    });
+    return map;
+  }, [logs, overseas]);
+
+  const allDepts = useMemo(() => {
+    const s = new Set<string>();
+    [...logs.map(l=>l.departemen), ...overseas.map(o=>o.departemen)].forEach(d=>d&&s.add(d));
+    return Array.from(s).sort();
+  }, [logs, overseas]);
+
+  const getEvents = (dateStr: string): CalEvent[] => {
+    const evs = eventMap[dateStr] || [];
+    return evs.filter(e => (!fDept || e.dept===fDept) && (!fTipe || e.tipe===fTipe));
+  };
+
+  const prevMonth = () => { if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1); };
+  const nextMonth = () => { if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1); };
+  const goToday   = () => { setYear(today.getFullYear()); setMonth(today.getMonth()); setSelDate(today.toISOString().slice(0,10)); };
+
+  // Build calendar grid
+  const firstDow = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+  const prevMonthDays = new Date(year, month, 0).getDate();
+  const cells: {day:number; cur:boolean; dateStr:string|null}[] = [];
+  for (let i=0;i<firstDow;i++) cells.push({day:prevMonthDays-firstDow+1+i, cur:false, dateStr:null});
+  for (let d=1;d<=daysInMonth;d++) {
+    const ds = `${year}-${String(month+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    cells.push({day:d, cur:true, dateStr:ds});
+  }
+  while (cells.length%7!==0) cells.push({day:cells.length-firstDow-daysInMonth+1, cur:false, dateStr:null});
+
+  const todayStr2 = today.toISOString().slice(0,10);
+  const selEvents = selDate ? getEvents(selDate) : [];
+
+  // Monthly summary
+  const monthDates = Array.from({length:daysInMonth}, (_,i) => `${year}-${String(month+1).padStart(2,'0')}-${String(i+1).padStart(2,'0')}`);
+  const cutiNamas  = new Set(monthDates.flatMap(d=>(eventMap[d]||[]).filter(e=>e.tipe==='cuti' && (!fDept||e.dept===fDept)).map(e=>e.nama)));
+  const ovsNamas   = new Set(monthDates.flatMap(d=>(eventMap[d]||[]).filter(e=>e.tipe==='overseas' && (!fDept||e.dept===fDept)).map(e=>e.nama)));
+
+  return (
+    <div className="h-full overflow-y-auto p-2 sm:p-4">
+      {/* Header controls */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div className="flex items-center gap-2">
+          <button onClick={prevMonth} className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600 font-bold transition">‹</button>
+          <span className="font-bold text-slate-800 min-w-[160px] text-center">{MONTH_ID[month]} {year}</span>
+          <button onClick={nextMonth} className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600 font-bold transition">›</button>
+          <button onClick={goToday} className="h-8 px-3 text-xs font-semibold bg-white border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600 transition">Hari ini</button>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <select value={fDept} onChange={e=>setFDept(e.target.value)} className="h-8 px-2 bg-white border border-slate-200 rounded-lg text-xs outline-none focus:border-[#005A9E]">
+            <option value="">Semua Departemen</option>
+            {allDepts.map(d=><option key={d} value={d}>{d}</option>)}
+          </select>
+          <select value={fTipe} onChange={e=>setFTipe(e.target.value as any)} className="h-8 px-2 bg-white border border-slate-200 rounded-lg text-xs outline-none focus:border-[#005A9E]">
+            <option value="">Cuti & Overseas</option>
+            <option value="cuti">Cuti saja</option>
+            <option value="overseas">Overseas saja</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-3 gap-2 mb-3">
+        {[
+          {v:cutiNamas.size,  l:'Karyawan cuti bulan ini',    c:'text-blue-700',    bg:'bg-blue-50 border-blue-100'},
+          {v:ovsNamas.size,   l:'Karyawan overseas bulan ini',c:'text-emerald-700', bg:'bg-emerald-50 border-emerald-100'},
+          {v:cutiNamas.size+ovsNamas.size, l:'Total tidak di kantor', c:'text-slate-700', bg:'bg-slate-50 border-slate-100'},
+        ].map(({v,l,c,bg})=>(
+          <div key={l} className={`border rounded-xl p-3 text-center ${bg}`}>
+            <div className={`text-2xl font-extrabold ${c}`}>{v}</div>
+            <div className="text-[10px] text-slate-400 mt-0.5 leading-tight">{l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Legend */}
+      <div className="flex items-center gap-4 mb-2 px-1">
+        <div className="flex items-center gap-1.5 text-[11px] text-slate-500"><span className="w-3 h-3 rounded bg-blue-300 inline-block"></span> Cuti</div>
+        <div className="flex items-center gap-1.5 text-[11px] text-slate-500"><span className="w-3 h-3 rounded bg-emerald-400 inline-block"></span> Overseas</div>
+      </div>
+
+      {/* Calendar grid */}
+      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden mb-3">
+        {/* Day headers */}
+        <div className="grid grid-cols-7 border-b border-slate-100">
+          {DAY_ID.map(d=>(
+            <div key={d} className="py-2 text-center text-[10px] font-bold text-slate-400 uppercase tracking-wider">{d}</div>
+          ))}
+        </div>
+        {/* Cells */}
+        <div className="grid grid-cols-7">
+          {cells.map((cell, idx) => {
+            if (!cell.cur) return (
+              <div key={idx} className="min-h-[72px] p-1 border-b border-r border-slate-50 opacity-30">
+                <span className="text-[11px] text-slate-300">{cell.day}</span>
+              </div>
+            );
+            const evs = getEvents(cell.dateStr!);
+            const isToday = cell.dateStr === todayStr2;
+            const isSel   = cell.dateStr === selDate;
+            const cutiCount = evs.filter(e=>e.tipe==='cuti').length;
+            const ovsCount  = evs.filter(e=>e.tipe==='overseas').length;
+            return (
+              <div key={idx}
+                onClick={() => setSelDate(cell.dateStr)}
+                className={`min-h-[72px] p-1 border-b border-r border-slate-100 cursor-pointer transition-colors
+                  ${isSel ? 'bg-blue-50 ring-2 ring-inset ring-[#005A9E]' : 'hover:bg-slate-50'}`}>
+                <div className="flex items-center justify-between mb-1">
+                  <span className={`text-[11px] font-semibold w-5 h-5 flex items-center justify-center rounded-full
+                    ${isToday ? 'bg-[#005A9E] text-white' : 'text-slate-600'}`}>{cell.day}</span>
+                </div>
+                {cutiCount > 0 && (
+                  <div className="text-[10px] bg-blue-100 text-blue-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium">
+                    {cutiCount > 1 ? `${cutiCount} cuti` : evs.find(e=>e.tipe==='cuti')?.nama.split(' ')[0]}
+                  </div>
+                )}
+                {ovsCount > 0 && (
+                  <div className="text-[10px] bg-emerald-100 text-emerald-700 rounded px-1 py-0.5 truncate font-medium">
+                    {ovsCount > 1 ? `${ovsCount} overseas` : evs.find(e=>e.tipe==='overseas')?.nama.split(' ')[0]}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Detail panel */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-4 min-h-[60px]">
+        {selDate ? (
+          <>
+            <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">
+              {new Date(selDate+'T12:00:00').toLocaleDateString('id-ID',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}
+              {selEvents.length > 0 && <span className="ml-2 text-slate-400">— {selEvents.length} orang</span>}
+            </div>
+            {selEvents.length === 0 ? (
+              <p className="text-sm text-slate-400 text-center py-2">Tidak ada cuti atau overseas</p>
+            ) : (
+              <div className="space-y-2">
+                {selEvents.map((ev, i) => (
+                  <div key={i} className="flex items-center gap-3 py-2 border-b border-slate-50 last:border-0">
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0
+                      ${ev.tipe==='cuti' ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                      {ev.nama.charAt(0).toUpperCase()}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-semibold text-slate-800 text-sm">{ev.nama}</div>
+                      <div className="text-[11px] text-slate-400">{ev.dept}{ev.info && ` · ${ev.info}`}</div>
+                    </div>
+                    <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full border flex-shrink-0
+                      ${ev.tipe==='cuti' ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-emerald-50 text-emerald-600 border-emerald-200'}`}>
+                      {ev.tipe === 'cuti' ? 'Cuti' : 'Overseas'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <p className="text-sm text-slate-400 text-center py-2">Klik tanggal untuk melihat detail</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── ANALYTICS PAGE ───────────────────────────────────────────────────────────
+function AnalyticsPage({ employees, logs, overseas }: { employees:Employee[]; logs:LogEntry[]; overseas:OverseasEntry[] }) {
+  const [viewMode, setViewMode] = useState<'dept'|'monthly'|'overseas'>('dept');
+
+  // Cuti per departemen
+  const deptData = useMemo(() => {
+    const map: Record<string, {jatah:number; terpakai:number; karyawan:number}> = {};
+    employees.forEach(e => {
+      if (!map[e.departemen]) map[e.departemen] = {jatah:0, terpakai:0, karyawan:0};
+      map[e.departemen].jatah    += e.jatahAwal;
+      map[e.departemen].terpakai += e.terpakai;
+      map[e.departemen].karyawan += 1;
+    });
+    return Object.entries(map).sort((a,b)=>b[1].terpakai-a[1].terpakai);
+  }, [employees]);
+
+  // Cuti per bulan (last 6 months)
+  const monthlyData = useMemo(() => {
+    const months: {label:string; key:string}[] = [];
+    const now = new Date();
+    for (let i=5;i>=0;i--) {
+      const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+      months.push({
+        label: `${MONTH_ID[d.getMonth()].slice(0,3)} ${d.getFullYear()}`,
+        key: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`
+      });
+    }
+    return months.map(m => {
+      const count = logs.filter(l => {
+        const skip = ['ditambahkan','diperbarui','reset','accrual','auto'].some(k=>l.keterangan.toLowerCase().includes(k));
+        if (skip) return false;
+        return l.timestamp.startsWith(m.key);
+      }).length;
+      return {...m, count};
+    });
+  }, [logs]);
+
+  // Overseas per tipe
+  const overseasData = useMemo(() => {
+    const comm = overseas.filter(o=>o.tipe==='Commissioning').length;
+    const serv = overseas.filter(o=>o.tipe==='Service').length;
+    const visa = overseas.filter(o=>o.tipe==='Mengurus Visa').length;
+    const other = overseas.filter(o=>o.tipe==='Other').length;
+    const depts: Record<string,number> = {};
+    overseas.forEach(o => { depts[o.departemen] = (depts[o.departemen]||0)+1; });
+    return { comm, serv, visa, other, depts: Object.entries(depts).sort((a,b)=>b[1]-a[1]) };
+  }, [overseas]);
+
+  const maxDeptVal = Math.max(...deptData.map(d=>d[1].terpakai), 1);
+  const maxMonthly = Math.max(...monthlyData.map(m=>m.count), 1);
+  const maxOvs     = Math.max(...overseasData.depts.map(d=>d[1]), 1);
+
+  const DEPT_COLORS = ['bg-blue-500','bg-emerald-500','bg-amber-500','bg-purple-500','bg-rose-500','bg-cyan-500'];
+
+  return (
+    <div className="h-full overflow-y-auto p-2 sm:p-4">
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+        {[
+          {v:employees.length, l:'Total Karyawan', c:'text-[#005A9E]', bg:'bg-blue-50 border-blue-100'},
+          {v:employees.reduce((s,e)=>s+e.terpakai,0), l:'Total Hari Cuti', c:'text-orange-600', bg:'bg-orange-50 border-orange-100'},
+          {v:overseas.filter(o=>o.status==='active').length, l:'Overseas Aktif', c:'text-emerald-700', bg:'bg-emerald-50 border-emerald-100'},
+          {v:employees.filter(e=>e.jatahAwal-e.terpakai<=0).length, l:'Cuti Habis', c:'text-red-600', bg:'bg-red-50 border-red-100'},
+        ].map(({v,l,c,bg})=>(
+          <div key={l} className={`border rounded-2xl p-3 text-center ${bg}`}>
+            <div className={`text-2xl font-extrabold ${c}`}>{v}</div>
+            <div className="text-[10px] text-slate-400 mt-0.5">{l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Tab selector */}
+      <div className="flex gap-1 bg-slate-100 rounded-xl p-1 mb-4 w-fit">
+        {([['dept','Per Departemen'],['monthly','Tren Bulanan'],['overseas','Overseas']] as const).map(([k,l])=>(
+          <button key={k} onClick={()=>setViewMode(k)}
+            className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition ${viewMode===k?'bg-white text-[#005A9E] shadow-sm':'text-slate-500 hover:text-slate-700'}`}>
+            {l}
+          </button>
+        ))}
+      </div>
+
+      {/* Chart: Per Departemen */}
+      {viewMode==='dept' && (
+        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
+          <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">Penggunaan Cuti per Departemen</div>
+          {deptData.length === 0 ? (
+            <p className="text-sm text-slate-400 text-center py-8">Belum ada data karyawan</p>
+          ) : deptData.map(([dept, data], i) => {
+            const pct = Math.round((data.terpakai / Math.max(data.jatah, 1)) * 100);
+            const barW = Math.round((data.terpakai / maxDeptVal) * 100);
+            return (
+              <div key={dept}>
+                <div className="flex items-center justify-between mb-1">
+                  <div>
+                    <span className="text-sm font-semibold text-slate-700">{dept}</span>
+                    <span className="text-xs text-slate-400 ml-2">{data.karyawan} karyawan</span>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-sm font-bold text-slate-700">{data.terpakai}</span>
+                    <span className="text-xs text-slate-400"> / {data.jatah} hari ({pct}%)</span>
+                  </div>
+                </div>
+                <div className="h-7 bg-slate-100 rounded-lg overflow-hidden relative">
+                  <div className={`h-full ${DEPT_COLORS[i % DEPT_COLORS.length]} rounded-lg transition-all`} style={{width:`${barW}%`}} />
+                  <div className="absolute inset-0 flex items-center px-2">
+                    <span className="text-[10px] font-bold text-white drop-shadow">{barW > 10 ? `${data.terpakai} hari` : ''}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Chart: Monthly trend */}
+      {viewMode==='monthly' && (
+        <div className="bg-white border border-slate-200 rounded-2xl p-4">
+          <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-6">Log Cuti per Bulan (6 Bulan Terakhir)</div>
+          <div className="flex items-end gap-3 h-48">
+            {monthlyData.map((m, i) => {
+              const h = Math.max(Math.round((m.count / maxMonthly) * 160), m.count > 0 ? 20 : 4);
+              return (
+                <div key={m.key} className="flex-1 flex flex-col items-center gap-1">
+                  <span className="text-xs font-bold text-[#005A9E]">{m.count > 0 ? m.count : ''}</span>
+                  <div className="w-full flex items-end justify-center">
+                    <div className={`w-full rounded-t-lg transition-all ${m.count>0?'bg-[#005A9E]':'bg-slate-100'}`} style={{height:`${h}px`}} />
+                  </div>
+                  <span className="text-[10px] text-slate-400 text-center leading-tight">{m.label}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Chart: Overseas */}
+      {viewMode==='overseas' && (
+        <div className="space-y-3">
+          <div className="bg-white border border-slate-200 rounded-2xl p-4">
+            <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">Tipe Overseas</div>
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                {v:overseasData.comm,  l:'Commissioning',  c:'text-purple-700', bg:'bg-purple-50 border-purple-100'},
+                {v:overseasData.serv,  l:'Service',        c:'text-amber-700',  bg:'bg-amber-50 border-amber-100'},
+                {v:overseasData.visa,  l:'Mengurus Visa',  c:'text-blue-700',   bg:'bg-blue-50 border-blue-100'},
+                {v:overseasData.other, l:'Other',          c:'text-slate-600',  bg:'bg-slate-50 border-slate-200'},
+              ].map(({v,l,c,bg})=>(
+                <div key={l} className={`border rounded-xl p-4 text-center ${bg}`}>
+                  <div className={`text-3xl font-extrabold ${c}`}>{v}</div>
+                  <div className="text-xs text-slate-400 mt-1">{l}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
+            <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Overseas per Departemen</div>
+            {overseasData.depts.length === 0 ? (
+              <p className="text-sm text-slate-400 text-center py-4">Belum ada data overseas</p>
+            ) : overseasData.depts.map(([dept, count], i) => {
+              const barW = Math.round((count / maxOvs) * 100);
+              return (
+                <div key={dept}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-sm font-semibold text-slate-700">{dept}</span>
+                    <span className="text-sm font-bold text-slate-700">{count}x</span>
+                  </div>
+                  <div className="h-6 bg-slate-100 rounded-lg overflow-hidden">
+                    <div className={`h-full ${DEPT_COLORS[i % DEPT_COLORS.length]} rounded-lg`} style={{width:`${barW}%`}} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 const HRLeaveManagement: React.FC = () => {
   const { time, date } = useClock();
   const {
-    employees, logs, overseas, appUsers, config, syncing, online,
+    employees, logs, overseas, appUsers, config, fatEntries, syncing, online,
     fbSaveEmployee, fbDeleteEmployee, fbAddLog, fbClearLogs,
-    fbSaveOverseas, fbDeleteOverseas, fbSaveUser, fbDeleteUser, fbSaveConfig
+    fbSaveOverseas, fbDeleteOverseas, fbSaveUser, fbDeleteUser, fbSaveConfig,
+    fbSaveFAT, fbDeleteFAT
   } = useFirebase();
 
-  // Auth state
-  const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
-  const [sessionExpiry, setSessionExpiry] = useState<number>(0);
+  // Auth state — restore session from localStorage on reload
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(() => {
+    try {
+      const saved = localStorage.getItem('hrms_session');
+      if (!saved) return null;
+      const parsed = JSON.parse(saved) as AppUser;
+      // Basic sanity check — must have required fields
+      if (!parsed?.id || !parsed?.username || !parsed?.role) return null;
+      return parsed;
+    } catch { return null; }
+  });
+  //const [sessionExpiry, setSessionExpiry] = useState<number>(0);
   const [showLogoutWarning, setShowLogoutWarning] = useState(false);
 
   // UI state
@@ -616,6 +1373,11 @@ const HRLeaveManagement: React.FC = () => {
   const [ovsFilter, setOvsFilter] = useState('');
   const [ovsSearch, setOvsSearch] = useState('');
 
+  // Global search
+  const [globalSearch, setGlobalSearch] = useState('');
+  const [globalOpen, setGlobalOpen] = useState(false);
+  const globalRef = useRef<HTMLDivElement>(null);
+
   // Status bar
   const [statusTxt, setStatusTxt] = useState('● Siap');
   const stRef = useRef<ReturnType<typeof setTimeout>|null>(null);
@@ -632,6 +1394,10 @@ const HRLeaveManagement: React.FC = () => {
   const [ovsOpen, setOvsOpen] = useState(false);
   const [ovsEntry, setOvsEntry] = useState<OverseasEntry|null>(null);
 
+  // FAT dialogs
+  const [fatOpen, setFatOpen] = useState(false);
+  const [fatEntry, setFatEntry] = useState<FATEntry|null>(null);
+
   // Config form
   const [cfgCompany, setCfgCompany] = useState(config.companyName);
   const [cfgAccrual, setCfgAccrual] = useState(config.monthlyAccrualDays);
@@ -644,6 +1410,16 @@ const HRLeaveManagement: React.FC = () => {
   const [newUserDisplay, setNewUserDisplay] = useState('');
   const [newUserPw, setNewUserPw] = useState('');
   const [newUserRole, setNewUserRole] = useState<UserRole>('viewer');
+  const [newUserLinked, setNewUserLinked] = useState('');
+
+  // Sync session to localStorage whenever currentUser changes
+  useEffect(() => {
+    if (currentUser) {
+      localStorage.setItem('hrms_session', JSON.stringify(currentUser));
+    } else {
+      localStorage.removeItem('hrms_session');
+    }
+  }, [currentUser]);
 
   useEffect(() => {
     setCfgCompany(config.companyName);
@@ -652,6 +1428,23 @@ const HRLeaveManagement: React.FC = () => {
     setCfgAutoLogout(config.autoLogoutMinutes);
     setCfgDepts(config.departments.join('\n'));
   }, [config]);
+
+  // Validate restored session against Firebase users (in case user was deleted)
+  useEffect(() => {
+    if (syncing || !currentUser || appUsers.length === 0) return;
+    const freshUser = appUsers.find(u => u.id === currentUser.id);
+    if (!freshUser) {
+      // User was deleted from Firebase — force logout
+      setCurrentUser(null);
+    } else {
+      // Always update session with latest data from Firebase (role may have changed)
+      setCurrentUser(prev => {
+        if (!prev) return prev;
+        return JSON.stringify(freshUser) !== JSON.stringify(prev) ? freshUser : prev;
+      });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appUsers.length, syncing]);
 
   // ─── AUTO LOGOUT ────────────────────────────────────────────────────────────
   const activityRef = useRef(Date.now());
@@ -712,17 +1505,19 @@ const HRLeaveManagement: React.FC = () => {
     });
   }, [employees]);
 
-  // ─── INIT DEFAULT ADMIN ──────────────────────────────────────────────────────
+  // ─── INIT DEFAULT ADMIN ─────────────────────────────────────────────────────
+  // Only runs when Firebase finishes syncing AND there are truly no users
   useEffect(() => {
-    if (appUsers.length === 0 && !syncing) {
-      // Create default super admin on first run
-      const defaultAdmin: AppUser = {
-        id: uid('usr'), username: 'admin', passwordHash: simpleHash('admin123'),
-        role: 'superadmin', displayName: 'Administrator', createdAt: nowTs()
-      };
-      fbSaveUser(defaultAdmin);
-    }
-  }, [appUsers.length, syncing]);
+    if (syncing) return;             // wait for Firebase to finish loading
+    if (appUsers.length > 0) return; // users already exist — never create default
+    if (localStorage.getItem('adminCreated')) return; // already created before
+    const defaultAdmin: AppUser = {
+      id: uid('usr'), username: 'admin', passwordHash: simpleHash('admin123'),
+      role: 'superadmin', displayName: 'Administrator', createdAt: nowTs()
+    };
+    fbSaveUser(defaultAdmin);
+    localStorage.setItem('adminCreated', 'true');
+  }, [syncing, appUsers.length, fbSaveUser]);
 
   // ─── HELPERS ────────────────────────────────────────────────────────────────
   const setStatus = (msg: string) => {
@@ -753,6 +1548,22 @@ const HRLeaveManagement: React.FC = () => {
     cutiDays <= 0 && inpMulai && inpSelesai ? '⚠ Tanggal selesai harus setelah tanggal mulai!' :
     (sisaSelected !== null && cutiDays > 0 && cutiDays > sisaSelected)
       ? `⚠ Kurang! Butuh ${cutiDays} hari, sisa cuti hanya ${sisaSelected} hari.` : '';
+
+  // Global search results
+  const globalResults = useMemo(() => {
+    const q = globalSearch.trim().toLowerCase();
+    if (q.length < 2) return {emps:[], logs_:[], ovs:[]};
+    const emps = employees.filter(e =>
+      e.nama.toLowerCase().includes(q) || (e.posisi||'').toLowerCase().includes(q) || e.departemen.toLowerCase().includes(q)
+    ).slice(0, 5);
+    const logs_ = logs.filter(l =>
+      l.nama.toLowerCase().includes(q) || l.keterangan.toLowerCase().includes(q)
+    ).slice(0, 5);
+    const ovs = overseas.filter(o =>
+      o.nama.toLowerCase().includes(q) || o.projectNo.toLowerCase().includes(q) || o.lokasi.toLowerCase().includes(q)
+    ).slice(0, 5);
+    return {emps, logs_, ovs};
+  }, [globalSearch, employees, logs, overseas]);
 
   const stats = {
     total: employees.length,
@@ -809,10 +1620,10 @@ const HRLeaveManagement: React.FC = () => {
   };
 
   const doLogCuti = () => {
-    if (!can(currentUser?.role || null, 'write')) { toast('Anda tidak punya izin untuk aksi ini.', 'error'); return; }
     if (!selectedId) { toast('Pilih karyawan terlebih dahulu.', 'warning'); return; }
     const emp = employees.find(e => e.id === selectedId);
     if (!emp) { toast('Karyawan tidak ditemukan!', 'error'); return; }
+    if (!canEditOwnLeave(currentUser, emp.nama)) { toast('Anda hanya dapat mencatat cuti milik Anda sendiri.', 'error'); return; }
     const sisa = emp.jatahAwal - emp.terpakai;
     if (sisa <= 0) { toast(`Jatah cuti '${emp.nama}' sudah habis!`, 'error'); return; }
     if (!inpMulai || !inpSelesai) { toast('Tanggal cuti harus diisi!', 'error'); return; }
@@ -907,6 +1718,28 @@ const HRLeaveManagement: React.FC = () => {
     });
   };
 
+  const doSaveFAT = async (data: Omit<FATEntry,'id'|'createdAt'|'createdBy'>) => {
+    if (!currentUser) return;
+    if (fatEntry) {
+      await fbSaveFAT({...fatEntry, ...data});
+      toast('Jadwal FAT diperbarui.');
+    } else {
+      const entry: FATEntry = {id:uid('fat'), ...data, createdAt:nowTs(), createdBy:currentUser.displayName};
+      await fbSaveFAT(entry);
+      toast(`FAT '${data.projectNo}' (${data.assignedTo}) dijadwalkan.`);
+    }
+    setFatOpen(false); setFatEntry(null);
+  };
+
+  const doDeleteFAT = (id: string) => {
+    if (!can(currentUser?.role || null, 'delete')) { toast('Anda tidak punya izin.', 'error'); return; }
+    const f = fatEntries.find(x => x.id === id); if (!f) return;
+    showConfirm('Hapus FAT', `Hapus jadwal FAT '${f.projectNo}' untuk '${f.assignedTo}'?`, true, async () => {
+      await fbDeleteFAT(id);
+      toast(`Jadwal FAT '${f.projectNo}' dihapus.`, 'warning');
+    });
+  };
+
   const doSaveConfig = async () => {
     if (!can(currentUser?.role || null, 'config')) { toast('Akses ditolak.', 'error'); return; }
     const newDepts = cfgDepts.split('\n').map(d=>d.trim()).filter(Boolean);
@@ -925,12 +1758,30 @@ const HRLeaveManagement: React.FC = () => {
     if (appUsers.find(u => u.username === newUserName)) { toast('Username sudah digunakan.', 'error'); return; }
     const newUser: AppUser = {
       id: uid('usr'), username: newUserName, passwordHash: simpleHash(newUserPw),
-      role: newUserRole, displayName: newUserDisplay, createdAt: nowTs()
+      role: newUserRole, displayName: newUserDisplay, createdAt: nowTs(),
+      ...(newUserLinked ? {linkedEmployeeName: newUserLinked} : {})
     };
     await fbSaveUser(newUser);
-    setNewUserName(''); setNewUserPw(''); setNewUserDisplay('');
+    setNewUserName(''); setNewUserPw(''); setNewUserDisplay(''); setNewUserLinked('');
     toast(`User '${newUserDisplay}' berhasil ditambahkan.`);
   };
+
+  // ─── CLEANUP DUPLICATE ADMINS (auto-run once) ───────────────────────────────
+  const cleanedRef = React.useRef(false);
+  useEffect(() => {
+    if (syncing || appUsers.length === 0 || cleanedRef.current) return;
+    // Find all users with username 'admin', keep only the first one (oldest createdAt)
+    const adminUsers = appUsers.filter(u => u.username === 'admin');
+    if (adminUsers.length > 1) {
+      adminUsers.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const toDelete = adminUsers.slice(1); // keep first, delete the rest
+      toDelete.forEach(u => fbDeleteUser(u.id));
+      cleanedRef.current = true;
+      toast(`${toDelete.length} duplikat Administrator dihapus otomatis.`, 'info');
+    } else {
+      cleanedRef.current = true;
+    }
+  }, [appUsers, syncing]);
 
   const doDeleteUser = (id: string) => {
     if (!can(currentUser?.role || null, 'manageUsers')) { toast('Akses ditolak.', 'error'); return; }
@@ -941,6 +1792,13 @@ const HRLeaveManagement: React.FC = () => {
       toast(`User '${u.displayName}' dihapus.`, 'warning');
     });
   };
+
+  // Auto-select linked employee for viewer role
+  useEffect(() => {
+    if (!currentUser?.linkedEmployeeName || currentUser.role !== 'viewer') return;
+    const emp = employees.find(e => e.nama === currentUser.linkedEmployeeName);
+    if (emp) setSelectedId(emp.id);
+  }, [employees, currentUser]);
 
   // Close ctx menu on click
   useEffect(() => {
@@ -967,6 +1825,9 @@ const HRLeaveManagement: React.FC = () => {
     {key:'dashboard', icon:'📊', label:'Dashboard'},
     {key:'history',   icon:'📜', label:'Log Cuti'},
     {key:'overseas',  icon:'✈️',  label:'Overseas'},
+    {key:'fat',       icon:'🔬', label:'Jadwal FAT'},
+    {key:'calendar'  as ActivePage, icon:'📅', label:'Kalender'},
+    {key:'analytics' as ActivePage, icon:'📈', label:'Analitik'},
     ...(can(currentUser.role, 'config') ? [{key:'config' as ActivePage, icon:'⚙️', label:'Konfigurasi'}] : []),
     ...(can(currentUser.role, 'manageUsers') ? [{key:'users' as ActivePage, icon:'👥', label:'Manajemen User'}] : []),
   ];
@@ -1010,8 +1871,74 @@ const HRLeaveManagement: React.FC = () => {
           </div>
         </div>
 
-        {/* Right: clock + sync + user */}
+        {/* Right: global search + clock + sync + user */}
         <div className="flex items-center gap-2">
+          {/* Global Search */}
+          <div className="relative" ref={globalRef}>
+            <div className="relative">
+              <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-white/50 text-xs pointer-events-none">🔍</span>
+              <input
+                className="w-36 sm:w-48 h-8 pl-7 pr-3 bg-white/10 border border-white/20 rounded-lg text-xs text-white placeholder-white/50 outline-none focus:bg-white/20 focus:border-white/40 transition"
+                placeholder="Cari karyawan, log…"
+                value={globalSearch}
+                onChange={e=>{setGlobalSearch(e.target.value);setGlobalOpen(true);}}
+                onFocus={()=>setGlobalOpen(true)}
+                onBlur={()=>setTimeout(()=>setGlobalOpen(false),150)}
+              />
+            </div>
+            {globalOpen && globalSearch.trim().length >= 2 && (
+              <div className="absolute top-10 right-0 w-80 bg-white border border-slate-200 rounded-xl shadow-2xl z-[9999] overflow-hidden max-h-80 overflow-y-auto">
+                {globalResults.emps.length===0 && globalResults.logs_.length===0 && globalResults.ovs.length===0 ? (
+                  <div className="p-4 text-sm text-slate-400 text-center">Tidak ada hasil untuk "{globalSearch}"</div>
+                ) : (
+                  <>
+                    {globalResults.emps.length > 0 && (
+                      <div>
+                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50">Karyawan</div>
+                        {globalResults.emps.map(e=>(
+                          <button key={e.id} onMouseDown={()=>{setActivePage('dashboard');setSearchQ(e.nama);setGlobalSearch('');setGlobalOpen(false);}}
+                            className="w-full px-3 py-2 text-left hover:bg-blue-50 transition flex items-center gap-2">
+                            <div className="w-7 h-7 bg-blue-100 rounded-full flex items-center justify-center text-xs font-bold text-blue-700 flex-shrink-0">{e.nama.charAt(0)}</div>
+                            <div>
+                              <div className="text-sm font-semibold text-slate-800">{e.nama}</div>
+                              <div className="text-[10px] text-slate-400">{e.posisi||e.departemen}</div>
+                            </div>
+                            <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full ${e.jatahAwal-e.terpakai<=0?'bg-red-100 text-red-600':e.jatahAwal-e.terpakai<=3?'bg-amber-100 text-amber-600':'bg-emerald-100 text-emerald-600'}`}>
+                              {e.jatahAwal-e.terpakai}h
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {globalResults.logs_.length > 0 && (
+                      <div>
+                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50">Log Cuti</div>
+                        {globalResults.logs_.map(l=>(
+                          <button key={l.id} onMouseDown={()=>{setActivePage('history');setGlobalSearch('');setGlobalOpen(false);}}
+                            className="w-full px-3 py-2 text-left hover:bg-blue-50 transition">
+                            <div className="text-sm font-semibold text-slate-800">{l.nama}</div>
+                            <div className="text-[10px] text-slate-400 truncate">{l.keterangan}</div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {globalResults.ovs.length > 0 && (
+                      <div>
+                        <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider bg-slate-50">Overseas</div>
+                        {globalResults.ovs.map(o=>(
+                          <button key={o.id} onMouseDown={()=>{setActivePage('overseas');setGlobalSearch('');setGlobalOpen(false);}}
+                            className="w-full px-3 py-2 text-left hover:bg-blue-50 transition">
+                            <div className="text-sm font-semibold text-slate-800">{o.nama} · {o.projectNo}</div>
+                            <div className="text-[10px] text-slate-400">{o.lokasi} · {o.tipe}</div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
           <span className="flex items-center gap-1.5">
             <span className={`w-2 h-2 rounded-full ${syncing?'bg-yellow-400 animate-pulse':online?'bg-emerald-400':'bg-red-500'}`} />
             <span className={`text-[11px] font-medium hidden sm:inline ${syncing?'text-yellow-300':online?'text-emerald-300':'text-red-300'}`}>
@@ -1052,6 +1979,12 @@ const HRLeaveManagement: React.FC = () => {
                   className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition text-left
                     ${activePage===item.key?'bg-[#005A9E] text-white shadow-sm':'text-slate-600 hover:bg-slate-200 hover:text-slate-800'}`}>
                   <span className="text-base">{item.icon}</span> {item.label}
+                  {item.key==='calendar' && (
+                    <span className="ml-auto text-[9px] font-bold bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded-full">NEW</span>
+                  )}
+                  {item.key==='analytics' && (
+                    <span className="ml-auto text-[9px] font-bold bg-purple-200 text-purple-700 px-1.5 py-0.5 rounded-full">NEW</span>
+                  )}
                   {item.key==='overseas' && stats.overseasActive>0 && (
                     <span className="ml-auto w-5 h-5 bg-emerald-500 text-white rounded-full text-[10px] font-bold flex items-center justify-center">{stats.overseasActive}</span>
                   )}
@@ -1105,7 +2038,17 @@ const HRLeaveManagement: React.FC = () => {
                       <span>＋</span> Tambah Karyawan
                     </button>
                     <div className="h-px bg-slate-300 !my-3" />
+                  </>
+                )}
+                {/* Pengambilan Cuti — visible for admin/superadmin AND linked viewer */}
+                {(can(currentUser.role, 'write') || !!currentUser.linkedEmployeeName) && (
+                  <>
                     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">Pengambilan Cuti</p>
+                    {currentUser.linkedEmployeeName && currentUser.role === 'viewer' && (
+                      <div className="px-3 py-2 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-700">
+                        🔒 Anda hanya dapat mencatat cuti milik <strong>{currentUser.linkedEmployeeName}</strong>
+                      </div>
+                    )}
                     {selectedEmp && (
                       <div className="px-3 py-2 bg-blue-50 border border-blue-200 rounded-xl text-[12px] text-blue-700 font-semibold">
                         ✓ Dipilih: {selectedEmp.nama}
@@ -1293,6 +2236,10 @@ const HRLeaveManagement: React.FC = () => {
                             {can(currentUser.role,'delete') && (
                               <button onClick={e=>{e.stopPropagation();doDelete(emp.id);}} className="flex-1 h-9 bg-red-50 text-red-600 rounded-xl text-xs font-bold hover:bg-red-100 transition">🗑️ Hapus</button>
                             )}
+                            {/* Viewer dengan linked employee bisa log cuti sendiri */}
+                            {!can(currentUser.role,'write') && canEditOwnLeave(currentUser, emp.nama) && (
+                              <button onClick={e=>{e.stopPropagation();setSelectedId(emp.id);setDrawerOpen(true);}} className="flex-1 h-9 bg-emerald-50 text-emerald-700 rounded-xl text-xs font-bold hover:bg-emerald-100 transition">📋 Log Cuti</button>
+                            )}
                           </div>
                         )}
                       </div>
@@ -1431,12 +2378,13 @@ const HRLeaveManagement: React.FC = () => {
                 </div>
 
                 {/* Stats */}
-                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
                   {[
                     {v:overseas.filter(o=>o.status==='active').length, l:'Berlangsung', c:'text-emerald-700', bg:'bg-emerald-50 border-emerald-200'},
                     {v:overseas.filter(o=>o.status==='upcoming').length, l:'Upcoming', c:'text-blue-700', bg:'bg-blue-50 border-blue-200'},
                     {v:overseas.filter(o=>o.status==='completed').length, l:'Selesai', c:'text-slate-600', bg:'bg-slate-50 border-slate-200'},
                     {v:overseas.filter(o=>o.tipe==='Commissioning').length, l:'Commissioning', c:'text-purple-700', bg:'bg-purple-50 border-purple-200'},
+                    {v:overseas.filter(o=>o.tipe==='Mengurus Visa').length, l:'Mengurus Visa', c:'text-blue-700', bg:'bg-blue-100 border-blue-300'},
                   ].map(({v,l,c,bg})=>(
                     <div key={l} className={`border rounded-2xl p-3 text-center ${bg}`}>
                       <div className={`text-2xl font-extrabold ${c}`}>{v}</div>
@@ -1476,7 +2424,11 @@ const HRLeaveManagement: React.FC = () => {
                             }[o.status];
                             const tipeBadge = o.tipe === 'Commissioning'
                               ? 'bg-purple-100 text-purple-700 border-purple-200'
-                              : 'bg-amber-100 text-amber-700 border-amber-200';
+                              : o.tipe === 'Service'
+                              ? 'bg-amber-100 text-amber-700 border-amber-200'
+                              : o.tipe === 'Mengurus Visa'
+                              ? 'bg-blue-100 text-blue-700 border-blue-200'
+                              : 'bg-slate-100 text-slate-600 border-slate-200';
                             return (
                               <tr key={o.id} className={`border-b border-slate-100 group ${i%2===0?'bg-white':'bg-slate-50'}`}>
                                 <td className="px-3 py-2.5">
@@ -1513,6 +2465,28 @@ const HRLeaveManagement: React.FC = () => {
                   )}
                 </div>
               </div>
+            )}
+
+            {/* ── PAGE: FAT ── */}
+            {activePage==='fat' && (
+              <FATPage
+                fatEntries={fatEntries}
+                employees={employees}
+                currentUser={currentUser}
+                onAdd={()=>{setFatEntry(null);setFatOpen(true);}}
+                onEdit={(entry)=>{setFatEntry(entry);setFatOpen(true);}}
+                onDelete={doDeleteFAT}
+              />
+            )}
+
+            {/* ── PAGE: CALENDAR ── */}
+            {activePage==='calendar' && (
+              <CalendarPage logs={logs} overseas={overseas} />
+            )}
+
+            {/* ── PAGE: ANALYTICS ── */}
+            {activePage==='analytics' && (
+              <AnalyticsPage employees={employees} logs={logs} overseas={overseas} />
             )}
 
             {/* ── PAGE: CONFIG ── */}
@@ -1629,6 +2603,18 @@ const HRLeaveManagement: React.FC = () => {
                           </select>
                         </div>
                       </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-500 mb-1.5">
+                          Link ke Karyawan <span className="text-slate-300 font-normal">(opsional — agar Viewer bisa log cutinya sendiri)</span>
+                        </label>
+                        <select className="w-full h-11 px-3 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:border-[#005A9E] focus:ring-2 focus:ring-[#005A9E]/10 transition"
+                          value={newUserLinked} onChange={e=>setNewUserLinked(e.target.value)}>
+                          <option value="">-- Tidak di-link --</option>
+                          {employees.sort((a,b)=>a.nama.localeCompare(b.nama)).map(e=>(
+                            <option key={e.id} value={e.nama}>{e.nama} ({e.departemen})</option>
+                          ))}
+                        </select>
+                      </div>
                       <button onClick={doAddUser}
                         className="w-full h-11 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-sm transition active:scale-95">
                         ➕ Tambah User
@@ -1669,6 +2655,9 @@ const HRLeaveManagement: React.FC = () => {
                           <div className="flex-1 min-w-0">
                             <div className="font-semibold text-slate-800 text-sm">{u.displayName}</div>
                             <div className="text-xs text-slate-400">@{u.username} · Bergabung {u.createdAt?.slice(0,10)}</div>
+                            {u.linkedEmployeeName && (
+                              <div className="text-[10px] text-emerald-600 font-medium">🔗 {u.linkedEmployeeName}</div>
+                            )}
                           </div>
                           <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold border ${roleBadge[u.role]}`}>
                             {roleLabel[u.role]}
@@ -1694,13 +2683,13 @@ const HRLeaveManagement: React.FC = () => {
           <div className="h-7 bg-[#E8EDF2] border-t border-slate-300 flex items-center justify-between px-4 flex-shrink-0">
             <span className="text-[11px] font-semibold text-[#005A9E] truncate" style={{fontFamily:"'JetBrains Mono',monospace"}}>{statusTxt}</span>
             <span className="text-[10px] text-slate-400 font-medium hidden sm:block ml-2">
-              {config.companyName} · Batam · HRMS v7.0 · {currentUser.displayName} ({roleLabel[currentUser.role]})
+            {config.companyName} · Batam · HRMS v9.0 · {currentUser.displayName} ({roleLabel[currentUser.role]})
             </span>
           </div>
 
           {/* ── FOOTER ── */}
           <footer className="w-full border-t border-slate-200 bg-white/95 text-center py-3 text-[11px] text-slate-500">
-            Developed by Syifa Dzikri Tsani · Automation Engineer · © 2026
+            Developed by Syifa Dzikri Tsani · Automation Engineer · © 2026 · HRMS v9.0
           </footer>
         </div>
       </div>
@@ -1735,6 +2724,10 @@ const HRLeaveManagement: React.FC = () => {
         onClose={()=>{setEditOpen(false);setEditEmp(null);}} />
       <OverseasDialog open={ovsOpen} entry={ovsEntry} employees={employees} currentUser={currentUser}
         onSave={doSaveOverseas} onClose={()=>{setOvsOpen(false);setOvsEntry(null);}} />
+      <FATDialog open={fatOpen} entry={fatEntry}
+        automationEngineers={employees.filter(e => e.departemen==='Electrical & Automation' && (e.posisi||'').toLowerCase().includes('automation'))}
+        fatEntries={fatEntries}
+        onSave={doSaveFAT} onClose={()=>{setFatOpen(false);setFatEntry(null);}} />
       <ToastContainer toasts={toasts} onRemove={id=>setToasts(p=>p.filter(t=>t.id!==id))} />
 
       <style>{`
