@@ -1,20 +1,22 @@
 {
   "name": "hrms-feenmarine",
   "private": true,
-  "version": "0.0.0",
+  "version": "12.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "deploy": "gh-pages -d dist",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "firebase:login": "npx firebase-tools login",
+    "firebase:use": "npx firebase-tools use feen-marine-hr",
+    "firebase:deploy:rules": "npx firebase-tools deploy --only database"
   },
   "dependencies": {
     "@iconify-json/fluent-color": "^1.2.21",
     "@iconify/react": "^6.0.2",
     "animate.css": "^4.1.1",
-    "date-holidays": "^3.27.0",
     "firebase": "^12.12.1",
     "lucide-react": "^1.8.0",
     "motion": "^12.38.0",

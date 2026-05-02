@@ -1,0 +1,164 @@
+import { can } from '../../utils/permissions';
+import { EmployeeManagementCard } from './components/EmployeeManagementCard';
+import { OwnAccountSection } from './components/OwnAccountSection';
+import { UserManagementSection } from './components/UserManagementSection';
+import type { UsersPageProps } from './types';
+
+export function UsersPage(props: UsersPageProps) {
+  const {
+    currentUser,
+    currentUserFirebaseUid,
+    employees,
+    setAddEmpOpen,
+    doOpenEdit,
+    doDelete,
+    doPickImportEmployeesCsv,
+    doDownloadEmployeesCsvTemplate,
+    ownEmployee,
+    ownVisaActive,
+    setOwnVisaActive,
+    activeVisaOptions,
+    ownVisaTypes,
+    setOwnVisaTypes,
+    doSaveOwnVisa,
+    ownVisaSaving,
+    roleLabel,
+    showOwnPwOld,
+    setShowOwnPwOld,
+    ownPwOld,
+    setOwnPwOld,
+    showOwnPwNew,
+    setShowOwnPwNew,
+    ownPwNew,
+    setOwnPwNew,
+    showOwnPwConfirm,
+    setShowOwnPwConfirm,
+    ownPwConfirm,
+    setOwnPwConfirm,
+    ownPwLoading,
+    doChangeOwnPassword,
+    newUserDisplay,
+    setNewUserDisplay,
+    newUserName,
+    setNewUserName,
+    showNewUserPw,
+    setShowNewUserPw,
+    newUserPw,
+    setNewUserPw,
+    newUserRole,
+    setNewUserRole,
+    newUserLinked,
+    setNewUserLinked,
+    newUserCanEditEmployeeData,
+    setNewUserCanEditEmployeeData,
+    doAddUser,
+    roleBadge,
+    appUsers,
+    editUserId,
+    editUserDisplay,
+    setEditUserDisplay,
+    editUserName,
+    setEditUserName,
+    showEditUserPw,
+    setShowEditUserPw,
+    editUserPw,
+    setEditUserPw,
+    editUserRole,
+    setEditUserRole,
+    editUserLinked,
+    setEditUserLinked,
+    editUserCanEditEmployeeData,
+    setEditUserCanEditEmployeeData,
+    doSaveEditUser,
+    doCancelEditUser,
+    doStartEditUser,
+    doDeleteUser,
+    doToggleUserEmployeeEdit,
+  } = props;
+
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4">
+      <div className="max-w-2xl mx-auto space-y-4">
+        <EmployeeManagementCard
+          currentUser={currentUser}
+          employees={employees}
+          setAddEmpOpen={setAddEmpOpen}
+          doOpenEdit={doOpenEdit}
+          doDelete={doDelete}
+          doPickImportEmployeesCsv={doPickImportEmployeesCsv}
+          doDownloadEmployeesCsvTemplate={doDownloadEmployeesCsvTemplate}
+        />
+        <OwnAccountSection
+          currentUser={currentUser}
+          currentUserFirebaseUid={currentUserFirebaseUid}
+          ownEmployee={ownEmployee}
+          ownVisaActive={ownVisaActive}
+          setOwnVisaActive={setOwnVisaActive}
+          activeVisaOptions={activeVisaOptions}
+          ownVisaTypes={ownVisaTypes}
+          setOwnVisaTypes={setOwnVisaTypes}
+          doSaveOwnVisa={doSaveOwnVisa}
+          ownVisaSaving={ownVisaSaving}
+          roleLabel={roleLabel}
+          showOwnPwOld={showOwnPwOld}
+          setShowOwnPwOld={setShowOwnPwOld}
+          ownPwOld={ownPwOld}
+          setOwnPwOld={setOwnPwOld}
+          showOwnPwNew={showOwnPwNew}
+          setShowOwnPwNew={setShowOwnPwNew}
+          ownPwNew={ownPwNew}
+          setOwnPwNew={setOwnPwNew}
+          showOwnPwConfirm={showOwnPwConfirm}
+          setShowOwnPwConfirm={setShowOwnPwConfirm}
+          ownPwConfirm={ownPwConfirm}
+          setOwnPwConfirm={setOwnPwConfirm}
+          ownPwLoading={ownPwLoading}
+          doChangeOwnPassword={doChangeOwnPassword}
+        />
+        <UserManagementSection
+          currentUser={currentUser}
+          canManageUsers={can(currentUser.role, 'manageUsers')}
+          employees={employees}
+          newUserDisplay={newUserDisplay}
+          setNewUserDisplay={setNewUserDisplay}
+          newUserName={newUserName}
+          setNewUserName={setNewUserName}
+          showNewUserPw={showNewUserPw}
+          setShowNewUserPw={setShowNewUserPw}
+          newUserPw={newUserPw}
+          setNewUserPw={setNewUserPw}
+          newUserRole={newUserRole}
+          setNewUserRole={setNewUserRole}
+          newUserLinked={newUserLinked}
+          setNewUserLinked={setNewUserLinked}
+          newUserCanEditEmployeeData={newUserCanEditEmployeeData}
+          setNewUserCanEditEmployeeData={setNewUserCanEditEmployeeData}
+          doAddUser={doAddUser}
+          roleBadge={roleBadge}
+          roleLabel={roleLabel}
+          appUsers={appUsers}
+          editUserId={editUserId}
+          editUserDisplay={editUserDisplay}
+          setEditUserDisplay={setEditUserDisplay}
+          editUserName={editUserName}
+          setEditUserName={setEditUserName}
+          showEditUserPw={showEditUserPw}
+          setShowEditUserPw={setShowEditUserPw}
+          editUserPw={editUserPw}
+          setEditUserPw={setEditUserPw}
+          editUserRole={editUserRole}
+          setEditUserRole={setEditUserRole}
+          editUserLinked={editUserLinked}
+          setEditUserLinked={setEditUserLinked}
+          editUserCanEditEmployeeData={editUserCanEditEmployeeData}
+          setEditUserCanEditEmployeeData={setEditUserCanEditEmployeeData}
+          doSaveEditUser={doSaveEditUser}
+          doCancelEditUser={doCancelEditUser}
+          doStartEditUser={doStartEditUser}
+          doDeleteUser={doDeleteUser}
+          doToggleUserEmployeeEdit={doToggleUserEmployeeEdit}
+        />
+      </div>
+    </div>
+  );
+}

@@ -29,6 +29,16 @@ export const canEditOwnLeave = (currentUser: AppUser | null, empNama: string): b
   return false;
 };
 
+/** Konfirmasi overseas selesai: hanya Super Admin, atau karyawan yang sedang overseas (akun terhubung ke `nama` entry). Peran Admin tidak dapat konfirmasi selesai. */
+export const canConfirmOverseasCompletion = (user: AppUser | null, overseasEmployeeName: string): boolean => {
+  if (!user || !overseasEmployeeName?.trim()) return false;
+  if (user.role === 'admin') return false;
+  if (user.role === 'superadmin') return true;
+  const linked = user.linkedEmployeeName?.trim().toLowerCase();
+  const nama = overseasEmployeeName.trim().toLowerCase();
+  return !!linked && linked === nama;
+};
+
 export const roleLabel: Record<UserRole, string> = {
   superadmin: 'Super Admin',
   admin: 'Admin',

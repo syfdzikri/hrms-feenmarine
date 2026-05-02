@@ -1,0 +1,21 @@
+{
+  "rules": {
+    ".read": true,
+    ".write": true,
+    "todoWorkspace": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      "projects": {
+        ".validate": "newData.isList() || !newData.exists()"
+      },
+      "tasks": {
+        ".indexOn": ["assigneeUserId"],
+        "$taskId": {
+          ".read": "data.exists() && data.child('assigneeFirebaseUid').isString() && data.child('assigneeFirebaseUid').val() === auth.uid",
+          ".write": "auth != null && ((!data.exists() && newData.exists() && newData.child('assigneeFirebaseUid').isString() && newData.child('createdByFirebaseUid').isString() && (newData.child('assigneeFirebaseUid').val() === auth.uid || newData.child('createdByFirebaseUid').val() === auth.uid)) || (data.exists() && newData.exists() && data.child('assigneeFirebaseUid').isString() && data.child('assigneeFirebaseUid').val() === auth.uid && newData.child('assigneeFirebaseUid').val() === data.child('assigneeFirebaseUid').val()) || (data.exists() && !newData.exists() && data.child('assigneeFirebaseUid').isString() && data.child('assigneeFirebaseUid').val() === auth.uid))",
+          ".validate": "newData.hasChildren(['id','project','title','priority','status','tags','completed','order','recurring','subtasks','createdAt','updatedAt','assigneeUserId','assigneeDisplayName','createdByUserId','createdByDisplayName','assigneeFirebaseUid','createdByFirebaseUid']) || !newData.exists()"
+        }
+      }
+    }
+  }
+}

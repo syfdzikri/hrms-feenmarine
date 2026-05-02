@@ -1,5 +1,4 @@
-import { useMemo, useState } from 'react';
-import Holidays from 'date-holidays';
+import { useEffect, useMemo, useState } from 'react';
 import { useI18n } from '../../i18n/store';
 import type { FATEntry, LogEntry, OverseasEntry } from '../../types';
 import { parseLeaveRange } from '../../utils/leave';
@@ -26,6 +25,33 @@ interface CalEvent {
   info?: string;
 }
 
+/** Satu baris perwakilan untuk izin: hindari menampilkan semua langkah approval/log sistem untuk orang & tanggal yang sama. */
+function pickRepresentativeIzinLog(rows: LogEntry[]): LogEntry {
+  if (rows.length <= 1) return rows[0];
+  const sorted = [...rows].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const submission = sorted.find((l) => /pengajuan/i.test(l.keterangan));
+  if (submission) return submission;
+  return sorted[sorted.length - 1];
+}
+
+function groupKeyIzin(log: LogEntry): string {
+  return `${log.tglCuti ?? ''}\u0001${log.nama.trim().toLowerCase()}\u0001${log.departemen}`;
+}
+
+function groupKeyCutiDay(dateStr: string, nama: string, dept: string): string {
+  return `${dateStr}\u0001${nama.trim().toLowerCase()}\u0001${dept}`;
+}
+
+/** Izin tidak punya `leaveStatus`; status akhir ditanggung teks log terbaru (dibatalkan / ditolak). */
+function shouldHideIzinGroupFromCalendar(rows: LogEntry[]): boolean {
+  if (!rows.length) return true;
+  const sorted = [...rows].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const k = (sorted[0].keterangan || '').trim();
+  if (/dibatalkan/i.test(k)) return true;
+  if (/DITOLAK\s+oleh/i.test(k)) return true;
+  return false;
+}
+
 export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[]; overseas: OverseasEntry[]; fatEntries: FATEntry[] }) {
   const { t, language } = useI18n();
   const today = new Date();
@@ -35,6 +61,7 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
   const [selDate, setSelDate] = useState<string | null>(todayLocal);
   const [fDept, setFDept] = useState('');
   const [fTipe, setFTipe] = useState<'' | 'cuti' | 'izin' | 'overseas' | 'fat'>('');
+  const [holidayMap, setHolidayMap] = useState<Record<string, string[]>>({});
 
   const todayStr2 = todayLocal;
   const fmtDate = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -46,19 +73,39 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
       map[date].push(ev);
     };
 
+    const cutiSeenPerDate: Record<string, Set<string>> = {};
+
     logs.forEach((log) => {
       const isLeaveLog = log.logType === 'leave' || log.status === 'used' || log.status === 'planned';
       if (!isLeaveLog) return;
       if (log.leaveStatus === 'canceled') return;
       const range = parseLeaveRange(log.tglCuti);
       if (!range) return;
-      datesBetween(range.start, range.end).forEach((d) => add(d, { nama: log.nama, dept: log.departemen, tipe: 'cuti' }));
+      datesBetween(range.start, range.end).forEach((d) => {
+        const k = groupKeyCutiDay(d, log.nama, log.departemen);
+        if (!cutiSeenPerDate[d]) cutiSeenPerDate[d] = new Set();
+        if (cutiSeenPerDate[d].has(k)) return;
+        cutiSeenPerDate[d].add(k);
+        add(d, { nama: log.nama, dept: log.departemen, tipe: 'cuti' });
+      });
     });
 
+    const izinByGroup = new Map<string, LogEntry[]>();
     logs.forEach((log) => {
-      if (log.logType !== 'izin') return;
-      if (!log.tglCuti) return;
-      add(log.tglCuti, { nama: log.nama, dept: log.departemen, tipe: 'izin', info: log.keterangan || 'Izin' });
+      if (log.logType !== 'izin' || !log.tglCuti) return;
+      const key = groupKeyIzin(log);
+      if (!izinByGroup.has(key)) izinByGroup.set(key, []);
+      izinByGroup.get(key)!.push(log);
+    });
+    izinByGroup.forEach((rows) => {
+      if (shouldHideIzinGroupFromCalendar(rows)) return;
+      const rep = pickRepresentativeIzinLog(rows);
+      add(rep.tglCuti!, {
+        nama: rep.nama,
+        dept: rep.departemen,
+        tipe: 'izin',
+        info: rep.keterangan?.trim() || 'Izin',
+      });
     });
 
     overseas.forEach((o) => {
@@ -92,19 +139,43 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
     return Array.from(s).sort();
   }, [logs, overseas, fatEntries]);
 
-  const holidayMap = useMemo<Record<string, string[]>>(() => {
-    const hd = new Holidays('ID');
-    const map: Record<string, string[]> = {};
-    hd.getHolidays(year).forEach((h) => {
-      if (h.type !== 'public') return;
-      const d = h.start instanceof Date ? h.start : new Date(h.date);
-      if (isNaN(d.getTime())) return;
-      const ds = fmtDate(d);
-      if (!map[ds]) map[ds] = [];
-      map[ds].push(h.name);
-    });
-    return map;
-  }, [year]);
+  const holidayYearsToLoad = useMemo(() => {
+    const s = new Set<number>([year]);
+    if (month === 0) s.add(year - 1);
+    if (month === 11) s.add(year + 1);
+    return [...s];
+  }, [year, month]);
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const loadHolidays = async () => {
+      try {
+        const map: Record<string, string[]> = {};
+        for (const y of holidayYearsToLoad) {
+          const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${y}/ID`, { signal: controller.signal });
+          if (!res.ok) continue;
+          const data = await res.json() as Array<{ date?: string; localName?: string; name?: string }>;
+          data.forEach((h) => {
+            if (!h?.date) return;
+            const d = new Date(`${h.date}T12:00:00`);
+            if (isNaN(d.getTime())) return;
+            const ds = fmtDate(d);
+            if (!map[ds]) map[ds] = [];
+            map[ds].push(h.localName || h.name || 'Holiday');
+          });
+        }
+        if (active) setHolidayMap(map);
+      } catch {
+        if (active) setHolidayMap({});
+      }
+    };
+    loadHolidays();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [holidayYearsToLoad]);
 
   const getEvents = (dateStr: string): CalEvent[] => (eventMap[dateStr] || []).filter((e) => (!fDept || e.dept === fDept) && (!fTipe || e.tipe === fTipe));
   const getHolidayNames = (dateStr: string): string[] => holidayMap[dateStr] || [];
@@ -129,14 +200,28 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
 
   const firstDow = new Date(year, month, 1).getDay();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const prevMonthDays = new Date(year, month, 0).getDate();
-  const cells: { day: number; cur: boolean; dateStr: string | null }[] = [];
-  for (let i = 0; i < firstDow; i++) cells.push({ day: prevMonthDays - firstDow + 1 + i, cur: false, dateStr: null });
+  const prevMonthLastDay = new Date(year, month, 0).getDate();
+  const prevM = month === 0 ? 11 : month - 1;
+  const prevY = month === 0 ? year - 1 : year;
+  const nextM = month === 11 ? 0 : month + 1;
+  const nextY = month === 11 ? year + 1 : year;
+
+  const cells: { day: number; inCurrentMonth: boolean; dateStr: string }[] = [];
+  for (let i = 0; i < firstDow; i++) {
+    const d = prevMonthLastDay - firstDow + 1 + i;
+    const ds = `${prevY}-${String(prevM + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    cells.push({ day: d, inCurrentMonth: false, dateStr: ds });
+  }
   for (let d = 1; d <= daysInMonth; d++) {
     const ds = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-    cells.push({ day: d, cur: true, dateStr: ds });
+    cells.push({ day: d, inCurrentMonth: true, dateStr: ds });
   }
-  while (cells.length % 7 !== 0) cells.push({ day: cells.length - firstDow - daysInMonth + 1, cur: false, dateStr: null });
+  let nextDay = 1;
+  while (cells.length % 7 !== 0) {
+    const ds = `${nextY}-${String(nextM + 1).padStart(2, '0')}-${String(nextDay).padStart(2, '0')}`;
+    cells.push({ day: nextDay, inCurrentMonth: false, dateStr: ds });
+    nextDay += 1;
+  }
 
   const selEvents = selDate ? getEvents(selDate) : [];
   const selHolidayNames = selDate ? getHolidayNames(selDate) : [];
@@ -150,7 +235,7 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
   const totalOutNamas = new Set<string>([...cutiOutNamas, ...ovsOutNamas]);
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 sm:p-4">
+    <div className="calendar-shell flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 sm:p-4">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
         <div className="flex items-center gap-2">
           <button onClick={prevMonth} className="w-8 h-8 flex items-center justify-center bg-white border border-slate-200 rounded-lg hover:bg-slate-50 text-slate-600 font-bold transition">‹</button>
@@ -173,14 +258,14 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+      <div className="calendar-kpi-grid grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
         {[
           { v: cutiNamas.size, l: t('Karyawan cuti bulan ini', 'Employees on leave this month'), c: 'text-blue-700', bg: 'bg-blue-50 border-blue-100' },
           { v: ovsNamas.size, l: t('Karyawan overseas bulan ini', 'Employees overseas this month'), c: 'text-emerald-700', bg: 'bg-emerald-50 border-emerald-100' },
           { v: fatNamas.size, l: t('Engineer FAT bulan ini', 'FAT engineers this month'), c: 'text-cyan-700', bg: 'bg-cyan-50 border-cyan-100' },
           { v: totalOutNamas.size, l: t('Total tidak di kantor (sedang keluar)', 'Total out of office'), c: 'text-amber-700', bg: 'bg-amber-50 border-amber-100' },
         ].map(({ v, l, c, bg }) => (
-          <div key={l} className={`border rounded-xl p-3 text-center ${bg}`}>
+          <div key={l} className={`calendar-kpi-card border rounded-xl p-3 text-center ${bg}`}>
             <div className={`text-2xl font-extrabold ${c}`}>{v}</div>
             <div className="text-[10px] text-slate-400 mt-0.5 leading-tight">{l}</div>
           </div>
@@ -195,52 +280,56 @@ export function CalendarPage({ logs, overseas, fatEntries }: { logs: LogEntry[];
         <div className="flex items-center gap-1.5 text-[11px] text-slate-500"><span className="w-3 h-3 rounded bg-rose-300 inline-block" /> {t('Hari libur nasional', 'National holiday')}</div>
       </div>
 
-      <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden mb-3">
+      <div className="calendar-board bg-white border border-slate-200 rounded-2xl overflow-hidden mb-3">
         <div className="grid grid-cols-7 border-b border-slate-100">
           {DAY_ID.map((d, dayIndex) => (
-            <div key={d} className={`py-2 text-center text-[10px] font-bold uppercase tracking-wider ${dayIndex === 0 ? 'text-rose-500' : 'text-slate-400'}`}>{d}</div>
+            <div key={d} className={`calendar-dow py-2 text-center text-[10px] font-bold uppercase tracking-wider ${dayIndex === 0 ? 'text-rose-500' : 'text-slate-400'}`}>{d}</div>
           ))}
         </div>
         <div className="grid grid-cols-7">
           {cells.map((cell, idx) => {
-            if (!cell.cur) {
-              return (
-                <div key={idx} className="min-h-[72px] p-1 border-b border-r border-slate-50 opacity-30">
-                  <span className="text-[11px] text-slate-300">{cell.day}</span>
-                </div>
-              );
-            }
-            const evs = getEvents(cell.dateStr!);
+            const evs = getEvents(cell.dateStr);
             const isToday = cell.dateStr === todayStr2;
             const isSel = cell.dateStr === selDate;
-            const holidayNames = getHolidayNames(cell.dateStr!);
+            const holidayNames = getHolidayNames(cell.dateStr);
             const isHoliday = holidayNames.length > 0;
             const isSunday = new Date(`${cell.dateStr}T12:00:00`).getDay() === 0;
             const cutiCount = evs.filter((e) => e.tipe === 'cuti').length;
             const izinCount = evs.filter((e) => e.tipe === 'izin').length;
             const ovsCount = evs.filter((e) => e.tipe === 'overseas').length;
             const fatCount = evs.filter((e) => e.tipe === 'fat').length;
+            const adjacent = !cell.inCurrentMonth;
+            const baseBg = adjacent
+              ? (isSel ? 'bg-slate-100 ring-2 ring-inset ring-[#005A9E]' : isHoliday ? 'bg-rose-50/50' : isSunday ? 'bg-rose-50/20' : 'bg-slate-50/90')
+              : (isSel ? 'bg-blue-50 ring-2 ring-inset ring-[#005A9E]' : isHoliday ? 'bg-rose-50/60 hover:bg-rose-50' : isSunday ? 'bg-rose-50/30 hover:bg-rose-50/50' : 'hover:bg-slate-50');
+            const dayNumClass = adjacent
+              ? `${isToday ? 'bg-[#005A9E] text-white' : isHoliday || isSunday ? 'text-rose-500/80' : 'text-slate-400'}`
+              : `${isToday ? 'bg-[#005A9E] text-white' : isHoliday || isSunday ? 'text-rose-700' : 'text-slate-600'}`;
+            const badgeMuted = adjacent ? 'opacity-85' : '';
+            const adjMonthShort = MONTH_ID[Math.max(0, Math.min(11, parseInt(cell.dateStr.slice(5, 7), 10) - 1))]?.slice(0, 3) ?? '';
             return (
               <div
-                key={idx}
+                key={`${cell.dateStr}-${idx}`}
                 onClick={() => setSelDate(cell.dateStr)}
-                className={`min-h-[72px] p-1 border-b border-r border-slate-100 cursor-pointer transition-colors ${isSel ? 'bg-blue-50 ring-2 ring-inset ring-[#005A9E]' : isHoliday ? 'bg-rose-50/60 hover:bg-rose-50' : isSunday ? 'bg-rose-50/30 hover:bg-rose-50/50' : 'hover:bg-slate-50'}`}
+                title={adjacent ? `${cell.dateStr} · ${t('Bukan bulan ini', 'Outside current month')}` : cell.dateStr}
+                className={`calendar-grid-cell min-h-[72px] p-1 border-b border-r ${adjacent ? 'calendar-grid-cell--adjacent border-slate-100/80' : 'border-slate-100'} cursor-pointer transition-colors ${baseBg}`}
               >
-                <div className="flex items-center justify-between mb-1">
-                  <span className={`text-[11px] font-semibold w-5 h-5 flex items-center justify-center rounded-full ${isToday ? 'bg-[#005A9E] text-white' : isHoliday || isSunday ? 'text-rose-700' : 'text-slate-600'}`}>{cell.day}</span>
+                <div className="flex items-center justify-between mb-1 gap-0.5">
+                  <span className={`text-[11px] font-semibold w-5 h-5 flex items-center justify-center rounded-full shrink-0 ${dayNumClass}`}>{cell.day}</span>
+                  {adjacent && <span className="text-[8px] font-semibold text-slate-400 truncate leading-tight pr-0.5" title={cell.dateStr}>{adjMonthShort}</span>}
                 </div>
-                {isHoliday && <div className="text-[10px] bg-rose-100 text-rose-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium">{holidayNames.length > 1 ? `${holidayNames[0]} +${holidayNames.length - 1}` : holidayNames[0]}</div>}
-                {cutiCount > 0 && <div className="text-[10px] bg-blue-100 text-blue-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium">{cutiCount > 1 ? `${cutiCount} ${t('cuti', 'leave')}` : evs.find((e) => e.tipe === 'cuti')?.nama.split(' ')[0]}</div>}
-                {izinCount > 0 && <div className="text-[10px] bg-orange-100 text-orange-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium">{izinCount > 1 ? `${izinCount} ${t('izin', 'permit')}` : evs.find((e) => e.tipe === 'izin')?.nama.split(' ')[0]}</div>}
-                {ovsCount > 0 && <div className="text-[10px] bg-emerald-100 text-emerald-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium">{ovsCount > 1 ? `${ovsCount} overseas` : evs.find((e) => e.tipe === 'overseas')?.nama.split(' ')[0]}</div>}
-                {fatCount > 0 && <div className="text-[10px] bg-cyan-100 text-cyan-700 rounded px-1 py-0.5 truncate font-medium">{fatCount > 1 ? `${fatCount} FAT` : `FAT · ${evs.find((e) => e.tipe === 'fat')?.nama.split(' ')[0]}`}</div>}
+                {isHoliday && <div className={`calendar-badge calendar-badge--holiday text-[10px] bg-rose-100/90 text-rose-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium ${badgeMuted}`}>{holidayNames.length > 1 ? `${holidayNames[0]} +${holidayNames.length - 1}` : holidayNames[0]}</div>}
+                {cutiCount > 0 && <div className={`calendar-badge calendar-badge--cuti text-[10px] bg-blue-100 text-blue-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium ${badgeMuted}`}>{cutiCount > 1 ? `${cutiCount} ${t('cuti', 'leave')}` : evs.find((e) => e.tipe === 'cuti')?.nama.split(' ')[0]}</div>}
+                {izinCount > 0 && <div className={`calendar-badge calendar-badge--izin text-[10px] bg-orange-100 text-orange-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium ${badgeMuted}`}>{izinCount > 1 ? `${izinCount} ${t('izin', 'permit')}` : evs.find((e) => e.tipe === 'izin')?.nama.split(' ')[0]}</div>}
+                {ovsCount > 0 && <div className={`calendar-badge calendar-badge--overseas text-[10px] bg-emerald-100 text-emerald-700 rounded px-1 py-0.5 mb-0.5 truncate font-medium ${badgeMuted}`}>{ovsCount > 1 ? `${ovsCount} overseas` : evs.find((e) => e.tipe === 'overseas')?.nama.split(' ')[0]}</div>}
+                {fatCount > 0 && <div className={`calendar-badge calendar-badge--fat text-[10px] bg-cyan-100 text-cyan-700 rounded px-1 py-0.5 truncate font-medium ${badgeMuted}`}>{fatCount > 1 ? `${fatCount} FAT` : `FAT · ${evs.find((e) => e.tipe === 'fat')?.nama.split(' ')[0]}`}</div>}
               </div>
             );
           })}
         </div>
       </div>
 
-      <div className="bg-white border border-slate-200 rounded-2xl p-4 min-h-[60px]">
+      <div className="calendar-detail bg-white border border-slate-200 rounded-2xl p-4 min-h-[60px]">
         {selDate ? (
           <>
             <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">
